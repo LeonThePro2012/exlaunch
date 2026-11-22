@@ -5,6 +5,7 @@
 constexpr uintptr_t CAVE_RVA        = 0x3D1B20;
 constexpr uintptr_t PATCH_RVA       = 0x3D1D4C;
 constexpr uintptr_t PARAM_BLOCK_RVA = 0x1018000;
+constexpr size_t PAGE_SIZE = 0x1000;
 
 // 完整260字节注入桩机器码
 const uint8_t g_cave_blob[] = {
@@ -61,23 +62,23 @@ inline uintptr_t GetMainBase()
     return exl::util::modules::GetTargetOffset(0);
 }
 
-// 页向下对齐，只保留用到这一个，删掉PageAlignUp消除unused警告
 static uintptr_t PageAlignDown(uintptr_t addr)
 {
-    constexpr size_t PAGE_SZ = 0x1000;
-    return addr & ~(PAGE_SZ - 1);
+    return addr & ~(PAGE_SIZE - 1);
 }
 
-// 直接内联汇编调用svcSetMemoryPermission SVC 0x73
-static void SvcSetMemPerm(void* va, uint64_t size, uint32_t perm)
+// 修复AArch64内联汇编约束
+static void SvcSetMemPerm(uint64_t va, uint64_t size, uint32_t perm)
 {
-    register uint64_t r0 asm("r0") = reinterpret_cast<uint64_t>(va);
-    register uint64_t r1 asm("r1") = size;
-    register uint64_t r2 asm("r2") = perm;
     asm volatile(
+        "mov x0, %0\n"
+        "mov x1, %1\n"
+        "mov x2, %2\n"
         "mov x8, #0x73\n"
         "svc #0\n"
-        ::"r0"(r0),"r1"(r1),"r2"(r2):"memory"
+        :
+        :"r"(va), "r"(size), "r"(perm)
+        :"x0","x1","x2","x8","memory"
     );
 }
 
@@ -91,31 +92,30 @@ extern "C" void exl_main(void* x0, void* x1)
     uintptr_t param_va   = main_base + PARAM_BLOCK_RVA;
 
     uintptr_t page_cave = PageAlignDown(cave_va);
-    constexpr size_t PAGE_SIZE = 0x1000;
 
-    // SVC: 设置页面为RW可写
-    SvcSetMemPerm(reinterpret_cast<void*>(page_cave), PAGE_SIZE, 1U);
+    // 设置RW
+    SvcSetMemPerm(page_cave, PAGE_SIZE, 1U);
 
-    // 拷贝完整机器码桩
+    // 拷贝机器码桩
     for(size_t i=0; i < sizeof(g_cave_blob); i++)
     {
         reinterpret_cast<uint8_t*>(cave_va)[i] = g_cave_blob[i];
     }
-    // 写入跳转劫持指令
+    // 写入跳转指令
     for(size_t i=0; i<4; i++)
     {
         reinterpret_cast<uint8_t*>(patch_va)[i] = g_jump_insn[i];
     }
 
-    // 恢复页面 RX（读‑执行）
-    SvcSetMemPerm(reinterpret_cast<void*>(page_cave), PAGE_SIZE, 5U);
+    // 恢复RX
+    SvcSetMemPerm(page_cave, PAGE_SIZE, 5U);
 
-    // 填充参数块（bss空隙，不需要改权限）
+    // 填充参数块
     GyroDefaultParam def{};
     *reinterpret_cast<GyroDefaultParam*>(param_va) = def;
 }
 
-// 必须的异常桩，防止链接报错
+// 必须异常桩
 extern "C" void exl_exception_entry(void* /*regs*/)
 {
     while(true);
