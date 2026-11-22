@@ -1,0 +1,35 @@
+name: Build Switch Mod
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+
+    steps:
+      - name: Checkout user code
+        uses: actions/checkout@v4
+
+      - name: Checkout exlaunch
+        uses: actions/checkout@v4
+        with:
+          repository: shadowninja108/exlaunch
+          path: build_env
+
+      - name: Build Mod
+        run: |
+          sed -i 's/LOAD_KIND := Module/LOAD_KIND := AsRtld/g' build_env/config.mk
+          cp main.cpp build_env/source/program/main.cpp
+          cd build_env
+          make
+          cp deploy/rtld subsdk3
+
+      - name: Upload subsdk3
+        uses: actions/upload-artifact@v4
+        with:
+          name: TR9-Gyro-Mod
+          path: build_env/subsdk3
+
