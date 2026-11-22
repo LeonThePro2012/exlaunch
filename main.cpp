@@ -5,7 +5,8 @@
 constexpr uintptr_t CAVE_RVA        = 0x3D1B20;
 constexpr uintptr_t PATCH_RVA       = 0x3D1D4C;
 constexpr uintptr_t PARAM_BLOCK_RVA = 0x1018000;
-constexpr size_t PAGE_SIZE = 0x1000;
+// 改名，避开exlaunch内置 PAGE_SIZE 宏冲突
+constexpr size_t MY_PAGE_SIZE = 0x1000;
 
 // 完整260字节注入桩机器码
 const uint8_t g_cave_blob[] = {
@@ -64,10 +65,10 @@ inline uintptr_t GetMainBase()
 
 static uintptr_t PageAlignDown(uintptr_t addr)
 {
-    return addr & ~(PAGE_SIZE - 1);
+    return addr & ~(MY_PAGE_SIZE - 1);
 }
 
-// 修复AArch64内联汇编约束
+// AArch64 svcSetMemoryPermission SVC 0x73
 static void SvcSetMemPerm(uint64_t va, uint64_t size, uint32_t perm)
 {
     asm volatile(
@@ -93,29 +94,29 @@ extern "C" void exl_main(void* x0, void* x1)
 
     uintptr_t page_cave = PageAlignDown(cave_va);
 
-    // 设置RW
-    SvcSetMemPerm(page_cave, PAGE_SIZE, 1U);
+    // 修改页面为可读写 RW=1
+    SvcSetMemPerm(page_cave, MY_PAGE_SIZE, 1U);
 
-    // 拷贝机器码桩
+    // 拷贝完整ARM64注入桩机器码到code‑cave
     for(size_t i=0; i < sizeof(g_cave_blob); i++)
     {
         reinterpret_cast<uint8_t*>(cave_va)[i] = g_cave_blob[i];
     }
-    // 写入跳转指令
+    // 写入跳转劫持指令
     for(size_t i=0; i<4; i++)
     {
         reinterpret_cast<uint8_t*>(patch_va)[i] = g_jump_insn[i];
     }
 
-    // 恢复RX
-    SvcSetMemPerm(page_cave, PAGE_SIZE, 5U);
+    // 恢复页面读执行 RX=5
+    SvcSetMemPerm(page_cave, MY_PAGE_SIZE, 5U);
 
     // 填充参数块
     GyroDefaultParam def{};
     *reinterpret_cast<GyroDefaultParam*>(param_va) = def;
 }
 
-// 必须异常桩
+// 必须的异常桩，防止链接报错
 extern "C" void exl_exception_entry(void* /*regs*/)
 {
     while(true);
