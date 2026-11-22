@@ -1,114 +1,112 @@
 #include "lib.hpp"
-#include <cmath>
 #include <cstdint>
 
-// ======================== 逆向RVA/偏移（和Ghidra/GDB调试版本严格对齐） ========================
-constexpr uintptr_t OFFSET_GYRO_MGR        = 0x147FB30;
-constexpr uintptr_t HOOK_TARGET_RVA        = 0x3D1D4C;
+// ============ 全部RVA和机器码来自已经验证的GyroAim_Leon_TheProfessional.txt ============
+constexpr uintptr_t CAVE_RVA        = 0x3D1B20;
+constexpr uintptr_t PATCH_RVA       = 0x3D1D4C;
+constexpr uintptr_t PARAM_BLOCK_RVA = 0x1018000;
 
-constexpr uint32_t MGR_OFF_GX              = 0x17D8;
-constexpr uint32_t MGR_OFF_GY              = 0x17DC;
-constexpr uint32_t MGR_OFF_BTN             = 0x1820;
-constexpr uint32_t BIT_ZL                  = 0x100U;
+// 注入桩完整260字节机器码（从GyroAim_Leon_TheProfessional.txt提取）
+const uint8_t g_cave_blob[] = {
+0xF0,0x00,0x62,0x29,0xB9,0x40,0x19,0x2A,
+0x52,0x88,0x29,0xAB,0x72,0xA8,0xEB,0x2B,
+0x6B,0x0B,0x01,0x5F,0x54,0x00,0x01,0xC0,
+0x52,0x80,0x00,0x0A,0x72,0xA8,0xB0,0x0A,
+0xB9,0x00,0x01,0x2A,0x52,0x80,0x00,0x0A,
+0x72,0xA8,0xB0,0x0A,0xB9,0x00,0x09,0x2A,
+0x52,0x85,0xDC,0x0A,0x72,0xA0,0x00,0x0A,
+0xB9,0x00,0x05,0x2A,0x52,0x80,0x20,0x0A,
+0x72,0xA0,0x00,0x0A,0xB9,0x00,0x0D,0x2A,
+0xB9,0x00,0x19,0x2B,0xF9,0x40,0x1F,0xF0,
+0xB9,0x40,0x0D,0x2A,0x34,0x00,0x00,0x8A,
+0x9A,0xCA,0x26,0x0C,0xF2,0x40,0x01,0x9F,
+0x54,0x00,0x04,0xE0,0xBD,0x40,0x01,0x22,
+0xBD,0x57,0xDB,0x80,0x1E,0x22,0x08,0x00,
+0x1E,0x38,0x00,0x10,0xB9,0x40,0x05,0x23,
+0x6B,0x03,0x02,0x1F,0x1A,0x83,0xB2,0x10,
+0x4B,0x03,0x03,0xE3,0x6B,0x03,0x02,0x1F,
+0x1A,0x83,0xC2,0x10,0x79,0xC0,0x93,0xE4,
+0x0B,0x10,0x00,0x84,0x52,0x8F,0xFF,0xE5,
+0x6B,0x05,0x00,0x9F,0x1A,0x85,0xB0,0x84,
+0x12,0x8F,0xFF,0xC5,0x6B,0x05,0x00,0x9F,
+0x1A,0x85,0xC0,0x84,0x79,0x00,0x93,0xE4,
+0xBD,0x40,0x09,0x23,0xBD,0x57,0xDF,0x80,
+0x1E,0x23,0x08,0x00,0x1E,0x38,0x00,0x10,
+0xB9,0x40,0x05,0x23,0x6B,0x03,0x02,0x1F,
+0x1A,0x83,0xB2,0x10,0x4B,0x03,0x03,0xE3,
+0x6B,0x03,0x02,0x1F,0x1A,0x83,0xC2,0x10,
+0x79,0xC0,0x9B,0xE4,0x0B,0x10,0x00,0x84,
+0x52,0x8F,0xFF,0xE5,0x6B,0x05,0x00,0x9F,
+0x1A,0x85,0xB0,0x84,0x12,0x8F,0xFF,0xC5,
+0x6B,0x05,0x00,0x9F,0x1A,0x85,0xC0,0x84,
+0x79,0x00,0x9B,0xE4,0xB9,0x40,0x13,0xE8,
+0x14,0x00,0x00,0x4C
+};
+// 跳转指令 b 0x3D1B20 机器码 0x17FFFF75
+const uint8_t g_jump_insn[4] = {0x75,0xFF,0xFF,0x17};
 
-// ======================== 配置常量 ========================
-struct GyroConfig
+// 默认参数，和mod.json保持一致
+struct GyroDefaultParam
 {
-    float   gain_x      = 4096.0f;
-    float   gain_y      = 4096.0f;
-    int32_t clamp_max   = 12000;
-    uint32_t inv_x      = 0U;
-    uint32_t inv_y      = 0U;
-} g_cfg;
-
-static inline int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi)
-{
-    if(v < lo) return lo;
-    if(v > hi) return hi;
-    return v;
-}
+    float       gain_x      = 4096.0f;
+    uint32_t    clamp       = 12000U;
+    float       gain_y      = 4096.0f;
+    uint32_t    zl_bit      = 0x100U;
+    uint8_t     reserved[8] = {0};
+    uint32_t    magic       = 0x4D415947U;
+};
 
 inline uintptr_t GetMainBase()
 {
     return exl::util::modules::GetTargetOffset(0);
 }
 
-static bool ReadGyro(float& gx, float& gy)
+// 按页向上对齐地址
+static uintptr_t PageAlignUp(uintptr_t addr)
 {
-    uintptr_t base = GetMainBase();
-    uintptr_t* ppMgr = reinterpret_cast<uintptr_t*>(base + OFFSET_GYRO_MGR);
-    uintptr_t mgr = *ppMgr;
-    if(mgr == 0U) return false;
-
-    gx = *reinterpret_cast<float*>(mgr + MGR_OFF_GX);
-    gy = *reinterpret_cast<float*>(mgr + MGR_OFF_GY);
-    return true;
+    constexpr size_t PAGE_SZ = 0x1000;
+    return (addr + PAGE_SZ - 1) & ~(PAGE_SZ - 1);
 }
-
-static bool ZL_IsPressed()
+static uintptr_t PageAlignDown(uintptr_t addr)
 {
-    uintptr_t base = GetMainBase();
-    uintptr_t* ppMgr = reinterpret_cast<uintptr_t*>(base + OFFSET_GYRO_MGR);
-    uintptr_t mgr = *ppMgr;
-    if(mgr == 0U) return false;
-
-    uint32_t btn = *reinterpret_cast<uint32_t*>(mgr + MGR_OFF_BTN);
-    return (btn & BIT_ZL) != 0U;
+    constexpr size_t PAGE_SZ = 0x1000;
+    return addr & ~(PAGE_SZ - 1);
 }
-
-// ======================== Trampoline 带寄存器上下文Context ========================
-HOOK_DEFINE_TRAMPOLINE(NpadGyroHook)
-{
-    static void Callback(exl::hook::Context& ctx)
-    {
-        // ========== 【重点：先修改栈，再执行游戏原始指令！和GDB断点顺序一致】 ==========
-        if(!ZL_IsPressed())
-        {
-            Orig(ctx);
-            return;
-        }
-
-        float gx = 0.0f, gy = 0.0f;
-        if(!ReadGyro(gx, gy))
-        {
-            Orig(ctx);
-            return;
-        }
-
-        int32_t delta_x = static_cast<int32_t>(gx * g_cfg.gain_x);
-        int32_t delta_y = static_cast<int32_t>(gy * g_cfg.gain_y);
-
-        if(g_cfg.inv_x) delta_x = -delta_x;
-        if(g_cfg.inv_y) delta_y = -delta_y;
-
-        delta_x = clamp_i32(delta_x, -g_cfg.clamp_max, g_cfg.clamp_max);
-        delta_y = clamp_i32(delta_y, -g_cfg.clamp_max, g_cfg.clamp_max);
-
-        // ctx.sp = 劫持瞬间真实栈指针，等价GDB的sp
-        uintptr_t sp = ctx.sp;
-        int16_t* stick_x = reinterpret_cast<int16_t*>(sp + 0x48);
-        int16_t* stick_y = reinterpret_cast<int16_t*>(sp + 0x4C);
-
-        int32_t new_x = static_cast<int32_t>(*stick_x) + delta_x;
-        int32_t new_y = static_cast<int32_t>(*stick_y) + delta_y;
-
-        new_x = clamp_i32(new_x, -32767, 32767);
-        new_y = clamp_i32(new_y, -32767, 32767);
-
-        *stick_x = static_cast<int16_t>(new_x);
-        *stick_y = static_cast<int16_t>(new_y);
-
-        // 修改完成，放行原始指令
-        Orig(ctx);
-    }
-};
 
 extern "C" void exl_main(void* x0, void* x1)
 {
     exl::hook::Initialize();
-    NpadGyroHook::InstallAtOffset(HOOK_TARGET_RVA);
+
+    uintptr_t main_base = GetMainBase();
+    uintptr_t cave_va    = main_base + CAVE_RVA;
+    uintptr_t patch_va   = main_base + PATCH_RVA;
+    uintptr_t param_va   = main_base + PARAM_BLOCK_RVA;
+
+    // ========= 修改text页面为可写 =========
+    uintptr_t page_cave = PageAlignDown(cave_va);
+    // exlaunch修改页面权限：RW‑, 写完切回 RX
+    exl::util::mem::SetPagePermissions(reinterpret_cast<void*>(page_cave), 0x1000, exl::util::mem::Perm_RW);
+
+    // 拷贝完整ARM64注入桩机器码到code‑cave
+    for(size_t i=0; i < sizeof(g_cave_blob); i++)
+    {
+        reinterpret_cast<uint8_t*>(cave_va)[i] = g_cave_blob[i];
+    }
+    // 写入跳转劫持指令
+    for(size_t i=0; i<4; i++)
+    {
+        reinterpret_cast<uint8_t*>(patch_va)[i] = g_jump_insn[i];
+    }
+
+    // 恢复页面为只读可执行 RX
+    exl::util::mem::SetPagePermissions(reinterpret_cast<void*>(page_cave), 0x1000, exl::util::mem::Perm_RX);
+
+    // ========= 填充参数块（data/bss空隙，不需要改页权限） =========
+    GyroDefaultParam def{};
+    *reinterpret_cast<GyroDefaultParam*>(param_va) = def;
 }
 
+// 必须保留异常桩，CI链接不报错
 extern "C" void exl_exception_entry(void* /*regs*/)
 {
     while(true);
@@ -118,4 +116,3 @@ extern "C" void exl_exception_handler(exl::exception::ExceptionInfo* /*info*/)
 {
     while(true);
 }
-
