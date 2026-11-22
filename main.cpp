@@ -1,12 +1,12 @@
 #include "lib.hpp"
 #include <cstdint>
 
-// ============ 全部RVA和机器码来自已经验证的GyroAim_Leon_TheProfessional.txt ============
+// ============ RVA / 机器码，来自已验证的GyroAim_Leon_TheProfessional.txt ============
 constexpr uintptr_t CAVE_RVA        = 0x3D1B20;
 constexpr uintptr_t PATCH_RVA       = 0x3D1D4C;
 constexpr uintptr_t PARAM_BLOCK_RVA = 0x1018000;
 
-// 注入桩完整260字节机器码（从GyroAim_Leon_TheProfessional.txt提取）
+// 完整260字节注入桩机器码
 const uint8_t g_cave_blob[] = {
 0xF0,0x00,0x62,0x29,0xB9,0x40,0x19,0x2A,
 0x52,0x88,0x29,0xAB,0x72,0xA8,0xEB,0x2B,
@@ -42,10 +42,10 @@ const uint8_t g_cave_blob[] = {
 0x79,0x00,0x9B,0xE4,0xB9,0x40,0x13,0xE8,
 0x14,0x00,0x00,0x4C
 };
-// 跳转指令 b 0x3D1B20 机器码 0x17FFFF75
+// b 0x3D1B20 跳转指令
 const uint8_t g_jump_insn[4] = {0x75,0xFF,0xFF,0x17};
 
-// 默认参数，和mod.json保持一致
+// 参数块内存布局，和ps1注入脚本完全对齐
 struct GyroDefaultParam
 {
     float       gain_x      = 4096.0f;
@@ -61,16 +61,24 @@ inline uintptr_t GetMainBase()
     return exl::util::modules::GetTargetOffset(0);
 }
 
-// 按页向上对齐地址
-static uintptr_t PageAlignUp(uintptr_t addr)
-{
-    constexpr size_t PAGE_SZ = 0x1000;
-    return (addr + PAGE_SZ - 1) & ~(PAGE_SZ - 1);
-}
+// 页向下对齐，只保留用到这一个，删掉PageAlignUp消除unused警告
 static uintptr_t PageAlignDown(uintptr_t addr)
 {
     constexpr size_t PAGE_SZ = 0x1000;
     return addr & ~(PAGE_SZ - 1);
+}
+
+// 直接内联汇编调用svcSetMemoryPermission SVC 0x73
+static void SvcSetMemPerm(void* va, uint64_t size, uint32_t perm)
+{
+    register uint64_t r0 asm("r0") = reinterpret_cast<uint64_t>(va);
+    register uint64_t r1 asm("r1") = size;
+    register uint64_t r2 asm("r2") = perm;
+    asm volatile(
+        "mov x8, #0x73\n"
+        "svc #0\n"
+        ::"r0"(r0),"r1"(r1),"r2"(r2):"memory"
+    );
 }
 
 extern "C" void exl_main(void* x0, void* x1)
@@ -82,12 +90,13 @@ extern "C" void exl_main(void* x0, void* x1)
     uintptr_t patch_va   = main_base + PATCH_RVA;
     uintptr_t param_va   = main_base + PARAM_BLOCK_RVA;
 
-    // ========= 修改text页面为可写 =========
     uintptr_t page_cave = PageAlignDown(cave_va);
-    // exlaunch修改页面权限：RW‑, 写完切回 RX
-    exl::util::mem::SetPagePermissions(reinterpret_cast<void*>(page_cave), 0x1000, exl::util::mem::Perm_RW);
+    constexpr size_t PAGE_SIZE = 0x1000;
 
-    // 拷贝完整ARM64注入桩机器码到code‑cave
+    // SVC: 设置页面为RW可写
+    SvcSetMemPerm(reinterpret_cast<void*>(page_cave), PAGE_SIZE, 1U);
+
+    // 拷贝完整机器码桩
     for(size_t i=0; i < sizeof(g_cave_blob); i++)
     {
         reinterpret_cast<uint8_t*>(cave_va)[i] = g_cave_blob[i];
@@ -98,15 +107,15 @@ extern "C" void exl_main(void* x0, void* x1)
         reinterpret_cast<uint8_t*>(patch_va)[i] = g_jump_insn[i];
     }
 
-    // 恢复页面为只读可执行 RX
-    exl::util::mem::SetPagePermissions(reinterpret_cast<void*>(page_cave), 0x1000, exl::util::mem::Perm_RX);
+    // 恢复页面 RX（读‑执行）
+    SvcSetMemPerm(reinterpret_cast<void*>(page_cave), PAGE_SIZE, 5U);
 
-    // ========= 填充参数块（data/bss空隙，不需要改页权限） =========
+    // 填充参数块（bss空隙，不需要改权限）
     GyroDefaultParam def{};
     *reinterpret_cast<GyroDefaultParam*>(param_va) = def;
 }
 
-// 必须保留异常桩，CI链接不报错
+// 必须的异常桩，防止链接报错
 extern "C" void exl_exception_entry(void* /*regs*/)
 {
     while(true);
